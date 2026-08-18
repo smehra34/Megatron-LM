@@ -576,6 +576,9 @@ class TestMultiTokenPrediction:
         args.mtp_num_layers = 2
         args.mtp_loss_scaling_factor = 0.1
         args.padded_vocab_size = 128800
+        # The legacy GPTModel provider below consumes ``args.vocab_size``
+        # directly, whereas the newer builder path uses padded_vocab_size.
+        args.vocab_size = args.padded_vocab_size
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 256

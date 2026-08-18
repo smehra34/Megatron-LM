@@ -12,6 +12,10 @@ import torch
 
 from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
+from megatron.core.datasets.input_token_masking import (
+    apply_input_token_masking,
+    build_input_masking_strategy,
+)
 from megatron.core.datasets.megatron_dataset import MegatronDataset
 from megatron.core.datasets.object_storage_utils import ObjectStorageConfig, is_object_storage_path
 from megatron.core.datasets.utils import Split
@@ -34,6 +38,21 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
 
     eod_mask_loss: Optional[bool] = None
     """Option to enable the EOD mask loss"""
+
+    input_mask_ratio: float = 0.0
+    """Portion of eligible training input tokens replaced by a mask token."""
+
+    input_mask_strategy: str = "random"
+    """Strategy used to select input positions: ``random`` or ``span``."""
+
+    input_mask_span_length: int = 1
+    """Length of each non-overlapping span for the ``span`` strategy."""
+
+    input_mask_token_id: Optional[int] = None
+    """Existing tokenizer ID used to corrupt inputs. No vocabulary token is added."""
+
+    input_mask_debug: bool = False
+    """Return original training inputs for a one-time rank-zero sanity print."""
 
     create_attention_mask: bool = True
     """Option to enable the attention masks generation. Can be disabled if attention kernel
@@ -91,6 +110,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
 
+        if not 0.0 <= self.input_mask_ratio <= 1.0:
+            raise ValueError(f"input_mask_ratio must be in [0, 1], got {self.input_mask_ratio}")
+        if self.input_mask_ratio > 0.0 and self.input_mask_token_id is None:
+            raise ValueError("input_mask_token_id is required when input masking is enabled")
+        build_input_masking_strategy(self.input_mask_strategy, self.input_mask_span_length)
+
         self.token_dtype_code = (
             None
             if self.tokenizer.vocab_size is None
@@ -144,6 +169,9 @@ class GPTDataset(MegatronDataset):
         self.cached_attention_mask = None
         self.cached_loss_mask = None
         self.cached_position_ids = None
+        self._input_masking_strategy = build_input_masking_strategy(
+            self.config.input_mask_strategy, self.config.input_mask_span_length
+        )
 
         (self.document_index, self.sample_index, self.shuffle_index) = (
             self._build_document_sample_shuffle_indices()
@@ -236,6 +264,7 @@ class GPTDataset(MegatronDataset):
         Returns:
             Dict[str, torch.Tensor]: The sample information wrapped in a dictionary
         """
+        sample_idx = idx
         if idx is None:
             # Batch padding sequence so the index does not matter
             text, _, document_lengths = self._query_document_sample_shuffle_indices(0)
@@ -275,6 +304,23 @@ class GPTDataset(MegatronDataset):
 
         # For padded sequences, mask the loss
         loss_mask[labels == self._pad_token_id] = 0.0
+
+        input_masked_positions = None
+        input_mask_original_tokens = None
+        if self.config.input_mask_ratio > 0.0:
+            input_masked_positions = torch.zeros_like(tokens, dtype=torch.bool)
+            if sample_idx is not None and self.index_split == Split.train:
+                if self.config.input_mask_debug:
+                    input_mask_original_tokens = tokens.clone()
+                tokens, input_masked_positions = apply_input_token_masking(
+                    tokens,
+                    mask_token_id=self.config.input_mask_token_id,
+                    eod_token_id=self.config.tokenizer.eod,
+                    pad_token_id=self._pad_token_id,
+                    ratio=self.config.input_mask_ratio,
+                    strategy=self._input_masking_strategy,
+                    seed=self.config.random_seed + int(sample_idx),
+                )
 
         # For padded sequences, ensure the embedding layer can map the token ID
         tokens[tokens == self._pad_token_id] = 0
@@ -347,6 +393,11 @@ class GPTDataset(MegatronDataset):
                 "loss_mask": loss_mask,
                 "position_ids": position_ids,
             }
+
+        if input_masked_positions is not None:
+            result["input_masked_positions"] = input_masked_positions
+        if input_mask_original_tokens is not None:
+            result["input_mask_original_tokens"] = input_mask_original_tokens
 
         return result
 

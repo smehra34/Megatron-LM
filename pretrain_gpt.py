@@ -40,6 +40,7 @@ from gpt_builders import gpt_builder
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.input_token_masking import build_input_masking_loss_report
 from megatron.core.enums import ModelType
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.gpt import GPTModel
@@ -98,6 +99,8 @@ BATCH_KEYS = [
     "cu_seqlens",
     "cu_seqlens_padded",
     "hybrid_cp_group",
+    "input_mask_original_tokens",
+    "input_masked_positions",
     "labels",
     "local_cp_size",
     "loss_mask",
@@ -105,6 +108,54 @@ BATCH_KEYS = [
     "position_ids",
     "tokens",
 ]
+
+_INPUT_MASK_DEBUG_PRINTED = False
+
+
+def _print_input_mask_debug_example(batch: dict[str, torch.Tensor]) -> None:
+    """Print and validate one actual corrupted training sequence on global rank zero."""
+    global _INPUT_MASK_DEBUG_PRINTED
+    args = get_args()
+    original = batch.get('input_mask_original_tokens')
+    # Debug reference data is never consumed by the model or CP partitioning.
+    batch['input_mask_original_tokens'] = None
+    if (
+        _INPUT_MASK_DEBUG_PRINTED
+        or not args.input_mask_debug
+        or original is None
+        or torch.distributed.get_rank() != 0
+    ):
+        return
+
+    limit = args.input_mask_debug_tokens
+    if limit <= 0:
+        raise ValueError(f"--input-mask-debug-tokens must be positive, got {limit}")
+    original = original[0, :limit].detach().cpu()
+    corrupted = batch['tokens'][0, :limit].detach().cpu()
+    masked = batch['input_masked_positions'][0, :limit].detach().cpu().bool()
+    changed = original != corrupted
+    if not torch.equal(changed, masked):
+        raise RuntimeError(
+            "input masking debug check failed: changed token positions do not match the mask"
+        )
+    if masked.any() and not torch.all(corrupted[masked] == args.input_mask_token_id):
+        raise RuntimeError(
+            "input masking debug check failed: a selected position does not contain the mask token"
+        )
+
+    print_rank_0("> input masking debug example (first training sample, shown once per job)")
+    print_rank_0(
+        f"> strategy={args.input_mask_strategy} ratio={args.input_mask_ratio} "
+        f"mask_token={args.input_mask_token!r} mask_token_id={args.input_mask_token_id}"
+    )
+    print_rank_0(f"> original input ids:  {original.tolist()}")
+    print_rank_0(f"> corrupted input ids: {corrupted.tolist()}")
+    if batch['labels'] is not None:
+        labels = batch['labels'][0, :limit].detach().cpu()
+        print_rank_0(f"> causal target ids:   {labels.tolist()}")
+    print_rank_0(f"> masked positions:    {masked.to(torch.int).tolist()}")
+    print_rank_0(f"> displayed masked fraction: {masked.float().mean().item():.6f}")
+    _INPUT_MASK_DEBUG_PRINTED = True
 
 
 def get_batch(data_iterator, vp_stage: Optional[int] = None):
@@ -117,6 +168,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
     has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
+    has_input_masking = args.input_mask_ratio > 0.0
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
@@ -136,6 +188,10 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
+        if has_input_masking and 'input_masked_positions' not in batch:
+            raise RuntimeError(
+                "input masking is enabled but the dataset did not return input_masked_positions"
+            )
         for key in BATCH_KEYS:
             batch[key] = (
                 batch[key].cuda(non_blocking=True)
@@ -148,6 +204,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
         broadcast_group=mpu.get_tensor_model_parallel_group(),
         has_cu_seqlens=has_cu_seqlens,
+        has_input_masking=has_input_masking,
         is_hybrid_cp=is_hybrid_cp,
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
         cp_size=cp_size,
@@ -160,22 +217,17 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
 
+    _print_input_mask_debug_example(batch)
+
     batch = flatten_batch_for_packed_sequences(batch)
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
         assert has_cu_seqlens
-        return (
-            None,
-            batch['cu_seqlens'],
-            batch['cu_seqlens_padded'],
-            None,
-            None,
-            None,
-            None,
-            batch['max_seqlen'],
-            None,
-            None,
-        )
+        values = {key: None for key in BATCH_KEYS}
+        values['cu_seqlens'] = batch['cu_seqlens']
+        values['cu_seqlens_padded'] = batch['cu_seqlens_padded']
+        values['max_seqlen'] = batch['max_seqlen']
+        return [values[key] for key in BATCH_KEYS]
 
     batch = get_batch_on_this_cp_rank(
         batch,
@@ -220,7 +272,10 @@ def _build_cached_logits_loss_func(
 
 
 def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
+    loss_mask: torch.Tensor,
+    output_tensor: torch.Tensor,
+    model: Optional[GPTModel] = None,
+    input_masked_positions: Optional[torch.Tensor] = None,
 ):
     """Loss function.
 
@@ -257,6 +312,10 @@ def loss_func(
 
         num_tokens = loss_mask.sum().clone().detach().to(torch.int)
         report = {'lm loss': torch.cat([loss.clone().detach().view(1), num_tokens.view(1)])}
+        if input_masked_positions is not None and getattr(model, 'training', True):
+            report.update(
+                build_input_masking_loss_report(losses, loss_mask, input_masked_positions)
+            )
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -312,6 +371,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             cu_seqlens,
             cu_seqlens_padded,
             hybrid_cp_group,
+            _input_mask_original_tokens,
+            input_masked_positions,
             labels,
             local_cp_size,
             loss_mask,
@@ -356,7 +417,12 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             schedule_plan = model.build_schedule_plan(
                 tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
             )
-            return schedule_plan, partial(loss_func, loss_mask, model=model)
+            return schedule_plan, partial(
+                loss_func,
+                loss_mask,
+                model=model,
+                input_masked_positions=input_masked_positions,
+            )
         else:
             output_tensor = model(
                 tokens,
@@ -368,7 +434,12 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(loss_func, loss_mask, model=model)
+    return output_tensor, partial(
+        loss_func,
+        loss_mask,
+        model=model,
+        input_masked_positions=input_masked_positions,
+    )
 
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
@@ -390,6 +461,66 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
 def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
     """Build the GPT (or FIM) dataset config from parsed CLI args."""
     tokenizer = build_tokenizer(args)
+
+    input_mask_token_id = None
+    if args.input_mask_ratio > 0.0:
+        if args.input_mask_token is None:
+            raise ValueError("--input-mask-token is required when --input-mask-ratio is positive")
+        if args.sft:
+            raise ValueError("input token masking is currently supported only for GPT pretraining")
+        if getattr(args, 'modelopt_enabled', False):
+            raise ValueError("input token masking metrics are not supported with ModelOpt")
+
+        vocab_size_before = tokenizer.vocab_size
+        vocab = tokenizer.vocab
+        if isinstance(vocab, dict):
+            input_mask_token_id = vocab.get(args.input_mask_token)
+        else:
+            try:
+                input_mask_token_id = vocab.index(args.input_mask_token)
+            except ValueError:
+                input_mask_token_id = None
+        if input_mask_token_id is None:
+            raise ValueError(
+                f"input mask token {args.input_mask_token!r} is not in the tokenizer vocabulary; "
+                "choose an existing reserved token (it will not be added automatically)"
+            )
+
+        encoded_mask_token = tokenizer.tokenize(args.input_mask_token)
+        if encoded_mask_token != [input_mask_token_id]:
+            raise ValueError(
+                f"input mask token {args.input_mask_token!r} must encode to exactly "
+                f"[{input_mask_token_id}], got {encoded_mask_token}"
+            )
+        if tokenizer.vocab_size != vocab_size_before:
+            raise RuntimeError("resolving the input mask token unexpectedly changed vocabulary size")
+        if input_mask_token_id >= args.padded_vocab_size:
+            raise ValueError(
+                f"input mask token id {input_mask_token_id} is outside padded vocabulary size "
+                f"{args.padded_vocab_size}"
+            )
+
+        protected_token_ids = set()
+        for attribute in ('eod', 'bos', 'pad'):
+            try:
+                token_id = getattr(tokenizer, attribute)
+            except (AttributeError, NotImplementedError):
+                continue
+            if token_id is not None:
+                protected_token_ids.add(token_id)
+        if input_mask_token_id in protected_token_ids:
+            raise ValueError(
+                f"input mask token {args.input_mask_token!r} resolves to protected token id "
+                f"{input_mask_token_id}"
+            )
+        args.input_mask_token_id = input_mask_token_id
+        print_rank_0(
+            "> input token masking: "
+            f"ratio={args.input_mask_ratio}, strategy={args.input_mask_strategy}, "
+            f"span_length={args.input_mask_span_length}, token={args.input_mask_token!r}, "
+            f"token_id={input_mask_token_id}, vocab_size={tokenizer.vocab_size}, "
+            f"padded_vocab_size={args.padded_vocab_size}"
+        )
 
     # Sometimes --data-path is too long, instead we parse it from a file.
     blend: Optional[Tuple[List[str], Optional[List[float]]]]
@@ -428,6 +559,11 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
         "hybrid_context_parallel": args.hybrid_context_parallel,
         "inter_document_masking": args.dataloader_inter_document_masking,
+        "input_mask_ratio": args.input_mask_ratio,
+        "input_mask_strategy": args.input_mask_strategy,
+        "input_mask_span_length": args.input_mask_span_length,
+        "input_mask_token_id": input_mask_token_id,
+        "input_mask_debug": args.input_mask_debug,
     }
 
     # add FIM args to the config

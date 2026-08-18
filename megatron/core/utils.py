@@ -2176,6 +2176,7 @@ def get_batch_on_this_tp_rank(
     pipeline_model_parallel_size: int = 1,
     is_pipeline_first_stage: bool = False,
     is_pipeline_last_stage: bool = False,
+    has_input_masking: bool = False,
 ):
     """Broadcast batch tensors from TP rank 0 to all other ranks in the TP group.
 
@@ -2200,6 +2201,8 @@ def get_batch_on_this_tp_rank(
             buffers are allocated internally).
         has_cu_seqlens (bool): Whether the batch contains cu_seqlens and
             max_seqlen metadata (e.g., SFT or --dataloader-inter-document-masking).
+        has_input_masking (bool): Whether the batch contains a boolean bitmap of
+            corrupted GPT input positions.
         is_hybrid_cp (bool): Whether hybrid context parallelism is enabled.
         create_attention_mask_in_dataloader (bool): Whether the dataloader
             creates an explicit attention mask tensor.
@@ -2256,6 +2259,8 @@ def get_batch_on_this_tp_rank(
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['position_ids'])
+            if has_input_masking:
+                _broadcast(batch['input_masked_positions'])
             if has_cu_seqlens or is_hybrid_cp:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
@@ -2286,6 +2291,8 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
+            if has_input_masking:
+                _broadcast(batch['input_masked_positions'])
             if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
@@ -2301,6 +2308,7 @@ def get_batch_on_this_tp_rank(
             batch["loss_mask"] = None
             batch["position_ids"] = None
             batch["attention_mask"] = None
+            batch["input_masked_positions"] = None
 
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast(batch['max_seqlen'])
@@ -2326,6 +2334,11 @@ def get_batch_on_this_tp_rank(
         max_seqlen = None
         attention_mask = None
         local_cp_size = None
+        input_masked_positions = (
+            torch.empty(shape, dtype=torch.bool, device=torch.cuda.current_device())
+            if has_input_masking
+            else None
+        )
 
         if has_cu_seqlens or is_hybrid_cp:
             max_seqlen = torch.empty(
@@ -2377,6 +2390,7 @@ def get_batch_on_this_tp_rank(
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(position_ids)
+            _broadcast(input_masked_positions)
             if has_cu_seqlens or is_hybrid_cp:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
@@ -2390,6 +2404,7 @@ def get_batch_on_this_tp_rank(
         elif is_pipeline_first_stage:
             labels = None
             loss_mask = None
+            input_masked_positions = None
 
             _broadcast(tokens)
             _broadcast(position_ids)
@@ -2407,6 +2422,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(labels)
             _broadcast(loss_mask)
+            _broadcast(input_masked_positions)
             if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
@@ -2438,6 +2454,7 @@ def get_batch_on_this_tp_rank(
             'max_seqlen': max_seqlen,
             'local_cp_size': local_cp_size,
             'hybrid_cp_group': None,
+            'input_masked_positions': input_masked_positions,
         }
 
     return batch
@@ -2491,7 +2508,7 @@ def _get_batch_on_this_cp_rank_per_document_balancing(
             cp_size,
             cp_rank,
         )
-        SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids')
+        SEQUENCE_KEYS = ('tokens', 'labels', 'loss_mask', 'position_ids', 'input_masked_positions')
         for key in SEQUENCE_KEYS:
             if batch.get(key) is not None:
                 batch[key] = batch[key].index_select(1, index)
@@ -2647,7 +2664,7 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
     if batch.get('max_seqlen') is not None:
         batch['max_seqlen'] = batch['max_seqlen'].max().unsqueeze(0)
 
-    for key in ('tokens', 'labels', 'loss_mask', 'position_ids'):
+    for key in ('tokens', 'labels', 'loss_mask', 'position_ids', 'input_masked_positions'):
         if batch.get(key) is not None:
             batch[key] = batch[key].reshape(1, -1)
 

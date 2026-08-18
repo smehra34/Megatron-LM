@@ -2935,7 +2935,11 @@ def load_checkpoint(
                 )
 
             # Load scheduler unless --finetune requests a fresh iteration and LR schedule.
-            if opt_param_scheduler is not None and not args.finetune:
+            if (
+                opt_param_scheduler is not None
+                and not args.finetune
+                and not args.reset_training_progress
+            ):
                 if 'lr_scheduler' in state_dict:  # backward compatbility
                     opt_param_scheduler.load_state_dict(state_dict['lr_scheduler'])
                 else:
@@ -3085,6 +3089,21 @@ def load_checkpoint(
 
     if has_nvidia_modelopt:
         print_distributed_quant_summary(model, msg='After loading checkpoint')
+
+    if args.reset_training_progress:
+        iteration = 0
+        args.consumed_train_samples = 0
+        args.skipped_train_samples = 0
+        args.consumed_valid_samples = 0
+        num_floating_point_operations_so_far = 0
+        update_num_microbatches(consumed_samples=0, verbose=True)
+        if opt_param_scheduler is not None:
+            opt_param_scheduler.num_steps = 0
+            opt_param_scheduler.step(0)
+        print_rank_0(
+            ' reset training and optimizer-parameter-scheduler progress while preserving '
+            'loaded model, optimizer, and RNG state'
+        )
 
     return iteration, num_floating_point_operations_so_far
 

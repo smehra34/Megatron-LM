@@ -1804,6 +1804,14 @@ def validate_args(args, defaults={}):
 
     if args.override_ckpt_iteration is not None:
         assert not args.finetune, "Cannot override checkpoint iteration together with finetune flag."
+        assert not args.reset_training_progress, (
+            "Cannot override checkpoint iteration while resetting training progress."
+        )
+    if args.reset_training_progress:
+        assert not args.finetune, (
+            "--reset-training-progress preserves optimizer and RNG state and cannot be combined "
+            "with --finetune."
+        )
 
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
@@ -2930,6 +2938,10 @@ def _add_checkpointing_args(parser):
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
                        help='Do not load rng state when loading checkpoint.')
+    group.add_argument('--reset-training-progress', action='store_true',
+                       help='Load model, optimizer, and RNG state but start iteration, sample, and '
+                            'optimizer-parameter-scheduler progress from zero. Intended for a new '
+                            'continued-pretraining phase with its own LR schedule.')
     group.add_argument('--override-ckpt-iteration', type=int, default=None,
                        help='Override the iteration stored in the loaded checkpoint. '
                             'Also resets consumed_train_samples accordingly so the '
@@ -3237,6 +3249,21 @@ def _add_data_args(parser):
                        'to individual documents.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--input-mask-ratio', type=float, default=0.0,
+                       help='Portion of eligible GPT training input tokens to replace with an '
+                            'existing mask token. Labels and the causal LM loss are unchanged.')
+    group.add_argument('--input-mask-strategy', type=str, default='random',
+                       choices=['random', 'span'],
+                       help='How to select GPT training input tokens for replacement.')
+    group.add_argument('--input-mask-span-length', type=int, default=1,
+                       help='Contiguous mask length used by --input-mask-strategy span.')
+    group.add_argument('--input-mask-token', type=str, default=None,
+                       help='Existing tokenizer token used for input replacement. The token is '
+                            'never added to or aliased in the tokenizer vocabulary.')
+    group.add_argument('--input-mask-debug', action='store_true',
+                       help='Print and validate the first corrupted training sample on each job.')
+    group.add_argument('--input-mask-debug-tokens', type=int, default=128,
+                       help='Maximum sequence positions printed by --input-mask-debug.')
     group.add_argument('--no-create-attention-mask-in-dataloader', action='store_false',
                        help='If set, do not create attention_masks in dataloader.',
                        dest='create_attention_mask_in_dataloader')

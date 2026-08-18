@@ -2659,7 +2659,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
                 # over the total number of tokens across the global batch.
                 val = torch.vstack(val).sum(dim=0)
                 torch.distributed.all_reduce(val, group=dp_cp_group)
-                loss_reduced[key] = val[0] / val[1]
+                loss_reduced[key] = val[0] / torch.clamp(val[1], min=1)
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
                 val = torch.cat(val).mean()
@@ -4445,7 +4445,7 @@ def evaluate(
 
     for key in total_loss_dict:
         numerator, denominator = total_loss_dict[key]
-        total_loss_dict[key] = numerator / denominator
+        total_loss_dict[key] = numerator / torch.clamp(denominator, min=1)
 
     timers('evaluate').stop()
     timers.log(['evaluate'])

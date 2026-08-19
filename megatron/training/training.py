@@ -2944,6 +2944,8 @@ def training_log(
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         ) / (elapsed_time_per_iteration * 10**12 * args.world_size)
+        tokens_per_second = batch_size * args.seq_length / elapsed_time_per_iteration
+        tokens_per_second_per_gpu = tokens_per_second / args.world_size
 
         one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
 
@@ -2967,11 +2969,28 @@ def training_log(
         )
         if args.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
+            log_string += f' tokens/s: {tokens_per_second:.0f} |'
+            log_string += f' tokens/s/GPU: {tokens_per_second_per_gpu:.0f} |'
             if args.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
+                    writer.add_scalar(
+                        'throughput/tokens_per_second', tokens_per_second, iteration
+                    )
+                    writer.add_scalar(
+                        'throughput/tokens_per_second_per_gpu',
+                        tokens_per_second_per_gpu,
+                        iteration,
+                    )
                 if wandb_writer:
-                    wandb_writer.log({'throughput': throughput}, iteration)
+                    wandb_writer.log(
+                        {
+                            'throughput': throughput,
+                            'throughput/tokens_per_second': tokens_per_second,
+                            'throughput/tokens_per_second_per_gpu': tokens_per_second_per_gpu,
+                        },
+                        iteration,
+                    )
         if args.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / args.world_size
             power = energy / elapsed_time_per_iteration

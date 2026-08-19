@@ -10,7 +10,10 @@ from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
 from megatron.core.dist_checkpointing.strategies.async_utils import AsyncCallsQueue
 from megatron.core.dist_checkpointing.strategies.filesystem_async import FileSystemWriterAsync
-from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
+from megatron.core.dist_checkpointing.strategies.nvrx import (
+    has_nvrx_async_support,
+    is_nvrx_min_version,
+)
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
@@ -163,3 +166,16 @@ class TestHasNvrxAsyncSupport:
         ):
             with pytest.raises(AssertionError, match="Minimum required nvidia-resiliency-ext"):
                 has_nvrx_async_support()
+
+    def test_version_check_uses_distribution_metadata_for_namespace_package(self):
+        """Container-preloaded namespace modules may not expose ``__version__``."""
+        namespace_module = mock.MagicMock(spec=[])
+        with (
+            mock.patch.dict(sys.modules, {'nvidia_resiliency_ext': namespace_module}),
+            mock.patch(
+                'megatron.core.dist_checkpointing.strategies.nvrx.distribution_version',
+                return_value='0.6.0',
+            ) as metadata_version,
+        ):
+            assert is_nvrx_min_version() is True
+            metadata_version.assert_called_once_with('nvidia-resiliency-ext')

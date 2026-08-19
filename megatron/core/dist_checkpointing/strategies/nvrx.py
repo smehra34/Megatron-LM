@@ -3,6 +3,7 @@
 """Helpers for interacting with the experimental nvidia-resiliency-ext API."""
 
 from importlib import import_module
+from importlib.metadata import PackageNotFoundError, version as distribution_version
 from typing import Any, Callable, Dict
 
 try:
@@ -82,6 +83,17 @@ def is_nvrx_min_version(version: str = NVRX_MIN_VERSION) -> bool:
     except (ImportError, ModuleNotFoundError):
         HAVE_NVRX = False
 
-    nvrx_version = str(nvrx.__version__) if HAVE_NVRX else "0.0.0"
+    if not HAVE_NVRX:
+        nvrx_version = "0.0.0"
+    else:
+        nvrx_version = getattr(nvrx, "__version__", None)
+        if nvrx_version is None:
+            # Some container environments preload NVRx as a namespace module,
+            # which has no package-level __version__ even though distribution
+            # metadata is available and its submodules are importable.
+            try:
+                nvrx_version = distribution_version("nvidia-resiliency-ext")
+            except PackageNotFoundError:
+                nvrx_version = "0.0.0"
 
-    return PkgVersion(nvrx_version) >= PkgVersion(version)
+    return PkgVersion(str(nvrx_version)) >= PkgVersion(version)

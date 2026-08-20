@@ -471,7 +471,6 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         if getattr(args, 'modelopt_enabled', False):
             raise ValueError("input token masking metrics are not supported with ModelOpt")
 
-        vocab_size_before = tokenizer.vocab_size
         vocab = tokenizer.vocab
         if isinstance(vocab, dict):
             input_mask_token_id = vocab.get(args.input_mask_token)
@@ -485,15 +484,10 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
                 f"input mask token {args.input_mask_token!r} is not in the tokenizer vocabulary; "
                 "choose an existing reserved token (it will not be added automatically)"
             )
-
-        encoded_mask_token = tokenizer.tokenize(args.input_mask_token)
-        if encoded_mask_token != [input_mask_token_id]:
-            raise ValueError(
-                f"input mask token {args.input_mask_token!r} must encode to exactly "
-                f"[{input_mask_token_id}], got {encoded_mask_token}"
-            )
-        if tokenizer.vocab_size != vocab_size_before:
-            raise RuntimeError("resolving the input mask token unexpectedly changed vocabulary size")
+        # Masking is applied directly to already-tokenized samples using this
+        # vocabulary ID. Do not validate by tokenizing the string: tokenizer
+        # wrappers may legitimately add BOS/EOS IDs around otherwise atomic
+        # tokens, and no text encoding occurs in the masking data path.
         if input_mask_token_id >= args.padded_vocab_size:
             raise ValueError(
                 f"input mask token id {input_mask_token_id} is outside padded vocabulary size "

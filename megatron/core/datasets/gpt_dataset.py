@@ -14,6 +14,7 @@ from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatr
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.input_token_masking import (
     apply_input_token_masking,
+    build_input_mask_offsets,
     build_input_masking_strategy,
 )
 from megatron.core.datasets.megatron_dataset import MegatronDataset
@@ -321,6 +322,7 @@ class GPTDataset(MegatronDataset):
                     strategy=self._input_masking_strategy,
                     seed=self.config.random_seed + int(sample_idx),
                 )
+            input_masked_positions = build_input_mask_offsets(input_masked_positions)
 
         # For padded sequences, ensure the embedding layer can map the token ID
         tokens[tokens == self._pad_token_id] = 0

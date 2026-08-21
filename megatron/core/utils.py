@@ -2335,7 +2335,7 @@ def get_batch_on_this_tp_rank(
         attention_mask = None
         local_cp_size = None
         input_masked_positions = (
-            torch.empty(shape, dtype=torch.bool, device=torch.cuda.current_device())
+            torch.empty(shape, dtype=torch.int32, device=torch.cuda.current_device())
             if has_input_masking
             else None
         )

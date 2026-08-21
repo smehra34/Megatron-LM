@@ -40,10 +40,14 @@ from gpt_builders import gpt_builder
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
-from megatron.core.datasets.input_token_masking import build_input_masking_loss_report
+from megatron.core.datasets.input_token_masking import (
+    InputMaskingMetricsLoggingHelper,
+    build_input_masking_loss_report,
+    compute_token_topk_correct,
+)
 from megatron.core.enums import ModelType
-from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.models.gpt import GPTModel
+from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -351,6 +355,66 @@ def loss_func(
     return loss, num_tokens, report
 
 
+def _input_masking_output_processor(
+    *,
+    hidden_states,
+    output_layer,
+    output_weight,
+    labels,
+    loss_mask,
+    runtime_gather_output,
+    compute_language_model_loss,
+    scale_logits,
+    context,
+    **_,
+):
+    """Compute the normal LM loss and detached mask-offset metrics.
+
+    Top-k candidates are selected only at masked positions, and only compact
+    correctness tensors survive beyond this function. The returned loss is
+    identical to the default GPT postprocess path.
+    """
+    logits, _ = output_layer(
+        hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+    )
+    logits = scale_logits(logits)
+    losses = compute_language_model_loss(labels, logits)
+
+    mask_offsets = context["mask_offsets"]
+    selected = (mask_offsets > 0) & loss_mask.bool()
+    selected_sequence_first = selected.transpose(0, 1).contiguous()
+    selected_logits = logits.detach()[selected_sequence_first]
+    selected_labels = labels.transpose(0, 1).contiguous()[selected_sequence_first]
+
+    logits_are_vocab_sharded = (
+        not runtime_gather_output
+        if runtime_gather_output is not None
+        else not getattr(output_layer, "gather_output", False)
+    )
+    selected_top1, selected_top5 = compute_token_topk_correct(
+        selected_logits,
+        selected_labels,
+        logits_are_vocab_sharded=logits_are_vocab_sharded,
+        tp_group=context["tp_group"],
+        max_k=5,
+    )
+    top1_correct = torch.zeros_like(selected_sequence_first)
+    top5_correct = torch.zeros_like(selected_sequence_first)
+    top1_correct[selected_sequence_first] = selected_top1
+    top5_correct[selected_sequence_first] = selected_top5
+
+    InputMaskingMetricsLoggingHelper.save_metrics(
+        losses=losses,
+        loss_mask=loss_mask,
+        mask_offsets=mask_offsets,
+        top1_correct=top1_correct.transpose(0, 1).contiguous(),
+        top5_correct=top5_correct.transpose(0, 1).contiguous(),
+        max_offsets=context["max_offsets"],
+        reduce_group=context["reduce_group"],
+    )
+    return losses
+
+
 def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = False):
     """Forward training step.
 
@@ -409,13 +473,30 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
     timers('batch-generator').stop()
 
+    output_processor = None
+    output_processor_context = None
+    if input_masked_positions is not None and get_attr_wrapped_model(model, "training"):
+        output_processor = _input_masking_output_processor
+        output_processor_context = {
+            "mask_offsets": input_masked_positions,
+            "max_offsets": args.seq_length,
+            "tp_group": mpu.get_tensor_model_parallel_group(),
+            "reduce_group": mpu.get_data_parallel_group(with_context_parallel=True),
+        }
+
     with stimer:
         if return_schedule_plan:
             assert (
                 args.overlap_moe_expert_parallel_comm
             ), "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"
             schedule_plan = model.build_schedule_plan(
-                tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+                tokens,
+                position_ids,
+                attention_mask,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_processor=output_processor,
+                output_processor_context=output_processor_context,
             )
             return schedule_plan, partial(
                 loss_func,
@@ -431,6 +512,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                 labels=labels,
                 loss_mask=loss_mask,
                 packed_seq_params=packed_seq_params,
+                output_processor=output_processor,
+                output_processor_context=output_processor_context,
             )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses

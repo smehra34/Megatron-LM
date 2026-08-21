@@ -199,6 +199,55 @@ class TestGPTModel:
         assert seen["scale_logits"].__self__ is self.gpt_model
 
     @pytest.mark.internal
+    def test_input_masking_metrics_processor_preserves_training_loss(self):
+        from megatron.core.datasets.input_token_masking import InputMaskingMetricsLoggingHelper
+        from pretrain_gpt import _input_masking_output_processor
+
+        sequence_length = self.gpt_model.max_sequence_length
+        micro_batch_size = 2
+        self.gpt_model.cuda()
+        self.gpt_model.eval()
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        labels = (input_ids + 1) % self.gpt_model.vocab_size
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+        loss_mask = torch.ones_like(labels, dtype=torch.float32)
+        mask_offsets = torch.tensor([[0, 1, 2, 0], [0, 1, 0, 0]], dtype=torch.int32).cuda()
+
+        InputMaskingMetricsLoggingHelper.tracker.clear()
+        default_loss = self.gpt_model.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+        )
+        metrics_loss = self.gpt_model.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            loss_mask=loss_mask,
+            output_processor=_input_masking_output_processor,
+            output_processor_context={
+                "mask_offsets": mask_offsets,
+                "max_offsets": sequence_length,
+                "tp_group": parallel_state.get_tensor_model_parallel_group(),
+                "reduce_group": parallel_state.get_data_parallel_group(
+                    with_context_parallel=True
+                ),
+            },
+        )
+
+        assert torch.equal(metrics_loss, default_loss)
+        assert InputMaskingMetricsLoggingHelper.tracker["counts"].sum().item() == 3
+        InputMaskingMetricsLoggingHelper.tracker.clear()
+
+    @pytest.mark.internal
     def test_build_schedule_plan_threads_output_processor(self):
         sequence_length = self.gpt_model.max_sequence_length
         micro_batch_size = 2

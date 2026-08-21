@@ -4815,12 +4815,19 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
             if valid_dataloaders[0] is None:
                 valid_data_iterators = [None] * len(valid_dataloaders)
             else:
-                valid_dl_type = "cyclic" if args.full_validation else dl_type
+                # Scheduled validation may require more samples than one physical epoch can
+                # provide (for example, an unweighted blend is deliberately capped at the
+                # available held-out corpus). Cycle validation independently so exhausting that
+                # corpus never terminates training. The ordering remains deterministic, and the
+                # training dataloader keeps its configured single/cyclic behavior.
+                valid_dl_type = (
+                    "cyclic" if args.full_validation or dl_type != "external" else dl_type
+                )
                 valid_data_iterators = [
                     _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
                 ]
         elif valid_dataloaders[0] is not None:
-            valid_dl_type = "cyclic" if args.full_validation else dl_type
+            valid_dl_type = "cyclic" if args.full_validation or dl_type != "external" else dl_type
             valid_data_iterators = _get_iterator(valid_dl_type, valid_dataloaders[0])
         else:
             valid_data_iterators = None

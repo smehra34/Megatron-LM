@@ -4,6 +4,7 @@ from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from megatron.core.tokenizers.utils.build_tokenizer import vocab_size_with_padding
@@ -90,6 +91,35 @@ class TestTraining:
         assert next(valid_iters[1]) == 20
         # data_parallel_size=1, so MAX across DP ranks equals the local lengths
         assert args.eval_iters == [2, 3]
+
+    def test_single_dataloader_cycles_validation_only(self, monkeypatch):
+        """A finite validation corpus can be reused without cycling training or test data."""
+        import megatron.training.training as training
+
+        args = create_test_args()
+        args.dataloader_type = "single"
+        args.consumed_train_samples = 0
+        args.consumed_valid_samples = 0
+        set_args(args)
+        monkeypatch.setattr(
+            training,
+            "build_train_valid_test_data_loaders",
+            lambda _: (
+                _LenDataloader([1]),
+                [_LenDataloader([2])],
+                _LenDataloader([3]),
+            ),
+        )
+
+        train_iter, valid_iter, test_iter = build_train_valid_test_data_iterators(lambda _: None)
+
+        assert next(train_iter) == 1
+        with pytest.raises(StopIteration):
+            next(train_iter)
+        assert [next(valid_iter), next(valid_iter)] == [2, 2]
+        assert next(test_iter) == 3
+        with pytest.raises(StopIteration):
+            next(test_iter)
 
     def test_closed_formula_vocab_size_with_padding(self):
         def old_round_impl(after, multiple):

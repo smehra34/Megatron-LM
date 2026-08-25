@@ -4729,7 +4729,13 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
                         # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
                         # correct and needs to be calculated/set per validation set
                         raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+                    valid_dataloaders.append(
+                        build_pretraining_data_loader(
+                            valid_d,
+                            args.consumed_valid_samples,
+                            cyclic_validation=True,
+                        )
+                    )
             if not args.multiple_validation_sets:
                 assert len(valid_dataloaders) == 1
             test_dataloader = build_pretraining_data_loader(test_ds, 0)

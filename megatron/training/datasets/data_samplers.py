@@ -16,7 +16,7 @@ from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 
 
-def build_pretraining_data_loader(dataset, consumed_samples):
+def build_pretraining_data_loader(dataset, consumed_samples, cyclic_validation=False):
     """Build dataloader given an input dataset."""
 
     if dataset is None:
@@ -59,7 +59,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 micro_batch_size=micro_batch_size,
                 global_batch_size=global_batch_size,
                 data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size())
+                data_parallel_size=mpu.get_data_parallel_world_size(),
+                cyclic=cyclic_validation)
         else:
             # Megatron sampler
             batch_sampler = MegatronPretrainingSampler(
@@ -67,7 +68,8 @@ def build_pretraining_data_loader(dataset, consumed_samples):
                 consumed_samples=consumed_samples,
                 micro_batch_size=micro_batch_size,
                 data_parallel_rank=mpu.get_data_parallel_rank(),
-                data_parallel_size=mpu.get_data_parallel_world_size())
+                data_parallel_size=mpu.get_data_parallel_world_size(),
+                cyclic=cyclic_validation)
     elif args.dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
@@ -135,6 +137,7 @@ class MegatronPretrainingSampler:
         data_parallel_rank,
         data_parallel_size,
         drop_last=True,
+        cyclic=False,
     ):
         # Keep a copy of input params for later use.
         self.total_samples = total_samples
@@ -143,12 +146,15 @@ class MegatronPretrainingSampler:
         self.data_parallel_rank = data_parallel_rank
         self.micro_batch_times_data_parallel_size = self.micro_batch_size * data_parallel_size
         self.drop_last = drop_last
+        self.cyclic = cyclic
 
         # Sanity checks.
         assert self.total_samples > 0, 'no sample to consume: {}'.format(self.total_samples)
-        assert (
-            self.consumed_samples < self.total_samples
-        ), 'no samples left to consume: {}, {}'.format(self.consumed_samples, self.total_samples)
+        assert self.cyclic or self.consumed_samples < self.total_samples, (
+            'no samples left to consume: {}, {}'.format(
+                self.consumed_samples, self.total_samples
+            )
+        )
         assert self.micro_batch_size > 0
         assert data_parallel_size > 0
         assert (
@@ -174,13 +180,32 @@ class MegatronPretrainingSampler:
 
     def __iter__(self):
         batch = []
+        if self.cyclic:
+            active_total_samples = (
+                self.total_samples
+                - self.total_samples % self.micro_batch_times_data_parallel_size
+            )
+            assert active_total_samples > 0, (
+                'validation dataset is too small for one data-parallel microbatch: '
+                f'{self.total_samples}, {self.micro_batch_times_data_parallel_size}'
+            )
+            cycle_offset = self.consumed_samples % active_total_samples
+            assert cycle_offset % self.micro_batch_times_data_parallel_size == 0
+            index_ranges = (
+                range(cycle_offset, active_total_samples),
+                range(0, cycle_offset),
+            )
+        else:
+            index_ranges = (range(self.consumed_samples, self.total_samples),)
+
         # Last batch will be dropped if drop_last is not set False
-        for idx in range(self.consumed_samples, self.total_samples):
-            batch.append(idx)
-            if len(batch) == self.micro_batch_times_data_parallel_size:
-                start_idx, end_idx = self.get_start_end_idx()
-                yield batch[start_idx:end_idx]
-                batch = []
+        for index_range in index_ranges:
+            for idx in index_range:
+                batch.append(idx)
+                if len(batch) == self.micro_batch_times_data_parallel_size:
+                    start_idx, end_idx = self.get_start_end_idx()
+                    yield batch[start_idx:end_idx]
+                    batch = []
 
         # Check the last partial batch and see drop_last is set
         if len(batch) > 0 and not self.drop_last:
@@ -195,9 +220,26 @@ class HybridCPMegatronPretrainingSampler(MegatronPretrainingSampler):
     of the entire global batch.
     """
 
-    def __init__(self, total_samples, consumed_samples, micro_batch_size, global_batch_size,
-                 data_parallel_rank, data_parallel_size, drop_last=True):
-        super().__init__(total_samples, consumed_samples, micro_batch_size, data_parallel_rank, data_parallel_size, drop_last)
+    def __init__(
+        self,
+        total_samples,
+        consumed_samples,
+        micro_batch_size,
+        global_batch_size,
+        data_parallel_rank,
+        data_parallel_size,
+        drop_last=True,
+        cyclic=False,
+    ):
+        super().__init__(
+            total_samples,
+            consumed_samples,
+            micro_batch_size,
+            data_parallel_rank,
+            data_parallel_size,
+            drop_last,
+            cyclic,
+        )
         self.global_batch_size = global_batch_size
         self.data_parallel_size = data_parallel_size
         self.num_micro_batches = self.global_batch_size // self.micro_batch_times_data_parallel_size
@@ -212,16 +254,35 @@ class HybridCPMegatronPretrainingSampler(MegatronPretrainingSampler):
 
     def __iter__(self):
         batch = []
+        samples_per_batch = (
+            self.micro_batch_times_data_parallel_size * self.num_micro_batches
+        )
+        if self.cyclic:
+            active_total_samples = self.total_samples - self.total_samples % samples_per_batch
+            assert active_total_samples > 0, (
+                'validation dataset is too small for one global batch: '
+                f'{self.total_samples}, {samples_per_batch}'
+            )
+            cycle_offset = self.consumed_samples % active_total_samples
+            assert cycle_offset % samples_per_batch == 0
+            index_ranges = (
+                range(cycle_offset, active_total_samples),
+                range(0, cycle_offset),
+            )
+        else:
+            index_ranges = (range(self.consumed_samples, self.total_samples),)
+
         # Last batch will be dropped if drop_last is not set False
-        for idx in range(self.consumed_samples, self.total_samples):
-            batch.append(idx)
-            if len(batch) == self.micro_batch_times_data_parallel_size * self.num_micro_batches:
-                start_idx, end_idx = self.get_start_end_idx_global_batch()
-                global_batch_idx = []
-                for i in range(self.num_micro_batches):
-                    global_batch_idx.extend(batch[start_idx[i]:end_idx[i]])
-                yield global_batch_idx
-                batch = []
+        for index_range in index_ranges:
+            for idx in index_range:
+                batch.append(idx)
+                if len(batch) == samples_per_batch:
+                    start_idx, end_idx = self.get_start_end_idx_global_batch()
+                    global_batch_idx = []
+                    for i in range(self.num_micro_batches):
+                        global_batch_idx.extend(batch[start_idx[i]:end_idx[i]])
+                    yield global_batch_idx
+                    batch = []
 
         # Check the last partial batch and see drop_last is set
         if len(batch) > 0 and not self.drop_last:

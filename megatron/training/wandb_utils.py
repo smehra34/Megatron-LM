@@ -16,15 +16,20 @@ def _get_artifact_name_and_version(save_dir: Path, checkpoint_path: Path) -> Tup
     return save_dir.stem, checkpoint_path.stem
 
 
-def on_save_checkpoint_success(checkpoint_path: str, tracker_filename: str, save_dir: str, iteration: int) -> None:
+def on_save_checkpoint_success(
+    checkpoint_path: str, save_dir: str, iteration: int, enabled: bool = False
+) -> None:
     """Function to be called after checkpointing succeeds and checkpoint is persisted for logging it as an artifact in W&B
 
     Args:
         checkpoint_path (str): path of the saved checkpoint
-        tracker_filename (str): path of the tracker filename for the checkpoint iteration
         save_dir (str): path of the root save folder for all checkpoints
         iteration (int): iteration of the checkpoint
+        enabled (bool): whether checkpoint artifact logging is enabled
     """
+
+    if not enabled:
+        return
 
     wandb_writer = get_wandb_writer()
 
@@ -35,23 +40,27 @@ def on_save_checkpoint_success(checkpoint_path: str, tracker_filename: str, save
         # wandb's artifact.add_reference requires absolute paths
         checkpoint_path = str(Path(checkpoint_path).resolve())
         artifact.add_reference(f"file://{checkpoint_path}", checksum=False)
-        artifact.add_file(tracker_filename)
         wandb_writer.run.log_artifact(artifact, aliases=[artifact_version])
         wandb_tracker_filename = _get_wandb_artifact_tracker_filename(save_dir)
         wandb_tracker_filename.write_text(f"{wandb_writer.run.entity}/{wandb_writer.run.project}")
 
 
-def on_load_checkpoint_success(checkpoint_path: str, load_dir: str) -> None:
+def on_load_checkpoint_success(
+    checkpoint_path: str, load_dir: str, enabled: bool = False
+) -> None:
     """Function to be called after succesful loading of a checkpoint, for aggregation and logging it to W&B
 
     Args:
         checkpoint_path (str): path of the loaded checkpoint
         load_dir (str): path of the root save folder for all checkpoints
-        iteration (int): iteration of the checkpoint
+        enabled (bool): whether checkpoint artifact logging is enabled
     """
 
+    if not enabled:
+        return
+
     wandb_writer = get_wandb_writer()
-    
+
     if wandb_writer:
         try:
             artifact_name, artifact_version = _get_artifact_name_and_version(Path(load_dir), Path(checkpoint_path))

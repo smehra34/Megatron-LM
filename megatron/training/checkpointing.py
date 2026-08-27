@@ -1153,7 +1153,10 @@ def save_checkpoint(
 
         def wandb_finalize_fn():
             wandb_utils.on_save_checkpoint_success(
-                checkpoint_name, get_checkpoint_tracker_filename(save_dir), save_dir, iteration
+                checkpoint_name,
+                save_dir,
+                iteration,
+                enabled=getattr(args, 'wandb_log_checkpoint_artifacts', False),
             )
 
         if args.async_save:
@@ -3066,7 +3069,11 @@ def load_checkpoint(
 
     # Additional callback for wandb (last rank)
     if not torch.distributed.is_initialized() or is_last_rank():
-        wandb_utils.on_load_checkpoint_success(checkpoint_name, load_dir)
+        wandb_utils.on_load_checkpoint_success(
+            checkpoint_name,
+            load_dir,
+            enabled=getattr(args, 'wandb_log_checkpoint_artifacts', False),
+        )
 
     torch.cuda.empty_cache()
 

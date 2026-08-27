@@ -345,6 +345,10 @@ class LoggerConfig:
     wandb_save_dir: str | None = None
     """Path to save the wandb results locally."""
 
+    wandb_log_checkpoint_artifacts: bool = False
+    """Log checkpoint references as W&B artifacts. Disabled by default because artifact
+    operations run during distributed checkpoint finalization and may block training."""
+
     wandb_entity: str | None = None
     """The wandb entity name. It is useful when there are multiple sub-projects in a project."""
 

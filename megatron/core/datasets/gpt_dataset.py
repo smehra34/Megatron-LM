@@ -44,10 +44,10 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """Portion of eligible training input tokens replaced by a mask token."""
 
     input_mask_strategy: str = "random"
-    """Strategy used to select input positions: ``random`` or ``span``."""
+    """Strategy used to select input positions: ``random``, ``span``, or ``variable_span``."""
 
     input_mask_span_length: int = 1
-    """Length of each non-overlapping span for the ``span`` strategy."""
+    """Fixed span length, or truncation maximum for ``variable_span``."""
 
     input_mask_token_id: Optional[int] = None
     """Existing tokenizer ID used to corrupt inputs. No vocabulary token is added."""

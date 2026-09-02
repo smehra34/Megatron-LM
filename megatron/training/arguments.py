@@ -3253,10 +3253,11 @@ def _add_data_args(parser):
                        help='Portion of eligible GPT training input tokens to replace with an '
                             'existing mask token. Labels and the causal LM loss are unchanged.')
     group.add_argument('--input-mask-strategy', type=str, default='random',
-                       choices=['random', 'span'],
+                       choices=['random', 'span', 'variable_span'],
                        help='How to select GPT training input tokens for replacement.')
     group.add_argument('--input-mask-span-length', type=int, default=1,
-                       help='Contiguous mask length used by --input-mask-strategy span.')
+                       help='Contiguous length for strategy span, or truncation maximum '
+                            'for variable_span.')
     group.add_argument('--input-mask-token', type=str, default=None,
                        help='Existing tokenizer token used for input replacement. The token is '
                             'never added to or aliased in the tokenizer vocabulary.')

@@ -2,6 +2,7 @@
 
 """Training-time corruption of GPT input tokens for noisy next-token prediction."""
 
+import math
 from abc import ABC, abstractmethod
 from typing import Dict, List, Optional, Tuple, Type
 
@@ -104,9 +105,99 @@ class SpanInputMaskingStrategy(InputMaskingStrategy):
         return selected
 
 
+class VariableSpanInputMaskingStrategy(InputMaskingStrategy):
+    """Select variable-length spans from a truncated geometric distribution.
+
+    Span lengths from one through the configured maximum have probability
+    proportional to ``0.5**length``. For example, a maximum of five gives
+    normalized weights proportional to ``[16, 8, 4, 2, 1]``. This standard
+    memoryless distribution emphasizes easier short spans while retaining a
+    diminishing tail of harder spans.
+    """
+
+    def __init__(self, span_length: int):
+        if span_length <= 0:
+            raise ValueError(
+                f"variable-span maximum length must be positive, got {span_length}"
+            )
+        self.max_span_length = span_length
+
+    @staticmethod
+    def _sample_span_length(max_length: int, generator: torch.Generator) -> int:
+        """Sample a geometric span length, conditioned on the feasible maximum."""
+        if max_length <= 0:
+            raise ValueError(f"maximum span length must be positive, got {max_length}")
+
+        # For weights 2^-length, the truncated CDF through length l is
+        # (1 - 2^-l) / (1 - 2^-max_length). Inverting it avoids constructing a
+        # probability vector and remains bounded for any configured maximum.
+        draw = float(torch.rand((), generator=generator).item())
+        normalization = 1.0 - math.ldexp(1.0, -max_length)
+        tail_probability = 1.0 - draw * normalization
+        length = math.floor(-math.log2(tail_probability)) + 1
+        return min(length, max_length)
+
+    def select(
+        self,
+        eligible: torch.Tensor,
+        ratio: float,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        """Select complete boundary-safe spans up to the target token budget.
+
+        At each step the length distribution is renormalized over lengths that
+        fit both the remaining budget and at least one free eligible run. The
+        start is then uniform over every feasible start position for that
+        length. This bounded policy uses shorter feasible spans near the end,
+        never rejects indefinitely, and reaches the exact floored token target
+        because length one is always available while capacity remains.
+        """
+        selected = torch.zeros_like(eligible, dtype=torch.bool)
+        remaining = int(eligible.sum().item() * ratio)
+        free_runs = SpanInputMaskingStrategy._eligible_runs(eligible)
+
+        while remaining and free_runs:
+            longest_run = max(end - start for start, end in free_runs)
+            feasible_max = min(self.max_span_length, remaining, longest_run)
+            span_length = self._sample_span_length(feasible_max, generator)
+
+            placements = [
+                (start, end, end - start - span_length + 1)
+                for start, end in free_runs
+                if end - start >= span_length
+            ]
+            total_placements = sum(count for _, _, count in placements)
+            placement = int(
+                torch.randint(total_placements, (1,), generator=generator).item()
+            )
+            for start, end, count in placements:
+                if placement < count:
+                    span_start = start + placement
+                    break
+                placement -= count
+
+            span_end = span_start + span_length
+            selected[span_start:span_end] = True
+            remaining -= span_length
+            updated_runs = []
+            for run_start, run_end in free_runs:
+                if run_start <= span_start < run_end:
+                    updated_runs.extend(
+                        interval
+                        for interval in ((run_start, span_start), (span_end, run_end))
+                        if interval[0] < interval[1]
+                    )
+                else:
+                    updated_runs.append((run_start, run_end))
+            free_runs = updated_runs
+
+        return selected
+
+
 _STRATEGIES: Dict[str, Type[InputMaskingStrategy]] = {
     "random": RandomInputMaskingStrategy,
     "span": SpanInputMaskingStrategy,
+    "variable_span": VariableSpanInputMaskingStrategy,
 }
 
 
@@ -117,7 +208,7 @@ def build_input_masking_strategy(name: str, span_length: int) -> InputMaskingStr
     except KeyError as exc:
         choices = ", ".join(sorted(_STRATEGIES))
         raise ValueError(f"unknown input mask strategy {name!r}; choose from: {choices}") from exc
-    return strategy_type(span_length) if name == "span" else strategy_type()
+    return strategy_type(span_length) if name in {"span", "variable_span"} else strategy_type()
 
 
 def apply_input_token_masking(

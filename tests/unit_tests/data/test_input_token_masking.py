@@ -5,6 +5,7 @@ import torch
 
 from megatron.core.datasets.input_token_masking import (
     InputMaskingMetricsLoggingHelper,
+    VariableSpanInputMaskingStrategy,
     apply_input_token_masking,
     build_input_mask_offsets,
     build_input_masking_loss_report,
@@ -65,6 +66,122 @@ def test_span_masking_rounds_down_to_complete_spans():
         list(range(10, 20)), ratio=0.4, strategy="span", span_length=2, seed=5
     )
     assert positions.sum().item() == 2
+
+
+def test_variable_span_masking_is_deterministic_and_seeded():
+    tokens = list(range(10, 110))
+    corrupted_a, positions_a = _apply(
+        tokens, ratio=0.35, strategy="variable_span", span_length=5, seed=7
+    )
+    corrupted_b, positions_b = _apply(
+        tokens, ratio=0.35, strategy="variable_span", span_length=5, seed=7
+    )
+    _, positions_c = _apply(
+        tokens, ratio=0.35, strategy="variable_span", span_length=5, seed=8
+    )
+
+    assert torch.equal(positions_a, positions_b)
+    assert torch.equal(corrupted_a, corrupted_b)
+    assert not torch.equal(positions_a, positions_c)
+    assert positions_a.sum().item() == int((len(tokens) - 1) * 0.35)
+
+
+def test_variable_span_zero_ratio_is_noop():
+    tokens = [10, 11, 12]
+    corrupted, positions = _apply(
+        tokens, ratio=0.0, strategy="variable_span", span_length=5
+    )
+    assert corrupted.tolist() == tokens
+    assert not positions.any()
+
+
+def test_variable_spans_respect_protected_positions_and_boundaries():
+    tokens = [10, 11, 12, 2, 20, 21, 3, 30, 31, 2, 40, 41, 42]
+    _, positions = _apply(
+        tokens, ratio=1.0, strategy="variable_span", span_length=5, seed=19
+    )
+
+    assert positions.tolist() == [
+        False,
+        True,
+        True,
+        False,
+        False,
+        True,
+        False,
+        True,
+        True,
+        False,
+        False,
+        True,
+        True,
+    ]
+
+
+def test_variable_span_samples_never_exceed_configured_maximum(monkeypatch):
+    strategy = build_input_masking_strategy("variable_span", 5)
+    sampled_lengths = []
+    original_sampler = strategy._sample_span_length
+
+    def recording_sampler(max_length, generator):
+        length = original_sampler(max_length, generator)
+        sampled_lengths.append(length)
+        return length
+
+    monkeypatch.setattr(strategy, "_sample_span_length", recording_sampler)
+    eligible = torch.ones(1000, dtype=torch.bool)
+    generator = torch.Generator().manual_seed(31)
+    selected = strategy.select(eligible, 0.8, generator)
+
+    assert selected.sum().item() == 800
+    assert sampled_lengths
+    assert max(sampled_lengths) <= 5
+
+
+@pytest.mark.parametrize(
+    ("eligible", "ratio", "expected"),
+    [
+        ([False, True, False, True], 0.75, 1),
+        ([False, True, False], 0.01, 0),
+        ([True, True, True], 1.0, 3),
+    ],
+)
+def test_variable_span_short_runs_and_small_budgets_terminate(eligible, ratio, expected):
+    strategy = build_input_masking_strategy("variable_span", 5)
+    selected = strategy.select(
+        torch.tensor(eligible), ratio, torch.Generator().manual_seed(41)
+    )
+    assert selected.sum().item() == expected
+
+
+def test_variable_span_length_distribution_is_truncated_geometric():
+    generator = torch.Generator().manual_seed(53)
+    counts = torch.zeros(5, dtype=torch.long)
+    for _ in range(31_000):
+        length = VariableSpanInputMaskingStrategy._sample_span_length(5, generator)
+        counts[length - 1] += 1
+
+    frequencies = counts.float() / counts.sum()
+    expected = torch.tensor([16, 8, 4, 2, 1], dtype=torch.float) / 31
+    assert torch.all(counts[:-1] > counts[1:])
+    assert torch.all(torch.abs(frequencies - expected) < 0.015)
+
+
+def test_existing_random_and_fixed_span_seeded_results_are_stable():
+    tokens = list(range(10, 20))
+    _, random_positions_a = _apply(tokens, ratio=0.4, strategy="random", seed=7)
+    _, random_positions_b = _apply(tokens, ratio=0.4, strategy="random", seed=7)
+    _, span_positions_a = _apply(
+        tokens, ratio=0.4, strategy="span", span_length=2, seed=7
+    )
+    _, span_positions_b = _apply(
+        tokens, ratio=0.4, strategy="span", span_length=2, seed=7
+    )
+
+    assert torch.equal(random_positions_a, random_positions_b)
+    assert torch.equal(span_positions_a, span_positions_b)
+    assert random_positions_a.sum().item() == 3
+    assert span_positions_a.sum().item() == 2
 
 
 def test_mask_offsets_use_final_contiguous_runs():
@@ -182,6 +299,18 @@ def test_invalid_ratio_is_rejected(ratio):
 def test_invalid_span_length_is_rejected():
     with pytest.raises(ValueError, match="must be positive"):
         build_input_masking_strategy("span", 0)
+
+
+def test_variable_span_maximum_is_a_general_positive_hyperparameter():
+    strategy = build_input_masking_strategy("variable_span", 17)
+    assert strategy.max_span_length == 17
+    generator = torch.Generator().manual_seed(67)
+    sampled = [strategy._sample_span_length(17, generator) for _ in range(2_000)]
+    assert max(sampled) > 5
+    assert max(sampled) <= 17
+
+    with pytest.raises(ValueError, match="must be positive"):
+        build_input_masking_strategy("variable_span", 0)
 
 
 def test_loss_report_uses_same_position_as_masked_input():
